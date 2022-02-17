@@ -1,0 +1,1031 @@
+/*
+ * =================================================================
+ *
+ *
+ *	Description:  samsung display common file
+ *
+ *	Author: jb09.kim
+ *	Company:  Samsung Electronics
+ *
+ * ================================================================
+ */
+/*
+<one line to give the program's name and a brief idea of what it does.>
+Copyright (C) 2015, Samsung Electronics. All rights reserved.
+
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+
+#include "ss_dsi_panel_common.h"
+#include <linux/preempt.h>
+
+static void ss_panel_recovery(struct samsung_display_driver_data *vdd);
+static void ss_event_osc_te_fitting(
+		struct samsung_display_driver_data *vdd, int event, void *arg);
+static irqreturn_t samsung_te_check_handler(int irq, void *handle);
+static void samsung_te_check_done_work(struct work_struct *work);
+static void ss_event_esd_recovery_init(
+		struct samsung_display_driver_data *vdd, int event, void *arg);
+static void samsung_display_delay_disp_on_work(struct work_struct *work);
+static void read_panel_data_work_fn(struct work_struct *work);
+
+struct samsung_display_driver_data vdd_data[MAX_DISPLAY_NDX];
+
+void __iomem *virt_mmss_gp_base;
+static DEFINE_MUTEX(dyn_mipi_clock);
+
+LIST_HEAD(vdds_list);
+
+char ss_panel_id0_get(struct samsung_display_driver_data *vdd)
+{
+	return (vdd->manufacture_id_dsi & 0xFF0000) >> 16;
+}
+
+char ss_panel_id1_get(struct samsung_display_driver_data *vdd)
+{
+	return (vdd->manufacture_id_dsi & 0xFF00) >> 8;
+}
+
+char ss_panel_id2_get(struct samsung_display_driver_data *vdd)
+{
+	return vdd->manufacture_id_dsi & 0xFF;
+}
+
+char ss_panel_rev_get(struct samsung_display_driver_data *vdd)
+{
+	return vdd->manufacture_id_dsi & 0x0F;
+}
+
+int ss_panel_attach_get(struct samsung_display_driver_data *vdd)
+{
+	return vdd->panel_attach_status;
+}
+
+int ss_panel_attach_set(struct samsung_display_driver_data *vdd, bool attach)
+{
+	/* 0bit->DSI0 1bit->DSI1 */
+	/* check the lcd id for DISPLAY_1 and DISPLAY_2 */
+	if (likely(ss_panel_attached(vdd->ndx) && attach))
+		vdd->panel_attach_status = true;
+	else
+		vdd->panel_attach_status = false;
+
+	LCD_INFO("panel_attach_status : %d\n", vdd->panel_attach_status);
+
+	return vdd->panel_attach_status;
+}
+
+/*
+ * Check the lcd id for DISPLAY_1 and DISPLAY_2 using the ndx
+ */
+int ss_panel_attached(int ndx)
+{
+	int lcd_id = 0;
+
+	/*
+	 * ndx 0 means DISPLAY_1 and ndx 1 means DISPLAY_2
+	 */
+	if (ndx == PRIMARY_DISPLAY_NDX)
+		lcd_id = get_lcd_attached("GET");
+	else if (ndx == SECONDARY_DISPLAY_NDX)
+		lcd_id = get_lcd_attached_secondary("GET");
+
+	/*
+	 * The 0xFFFFFF is the id for PBA booting
+	 * if the id is same with 0xFFFFFF, this function
+	 * will return 0
+	 */
+	return !(lcd_id == PBA_ID);
+}
+
+static int ss_parse_panel_id(char *panel_id)
+{
+	char *pt;
+	int lcd_id = 0;
+
+	if (!IS_ERR_OR_NULL(panel_id))
+		pt = panel_id;
+	else
+		return lcd_id;
+
+	for (pt = panel_id; *pt != 0; pt++)  {
+		lcd_id <<= 4;
+		switch (*pt) {
+		case '0' ... '9':
+			lcd_id += *pt - '0';
+			break;
+		case 'a' ... 'f':
+			lcd_id += 10 + *pt - 'a';
+			break;
+		case 'A' ... 'F':
+			lcd_id += 10 + *pt - 'A';
+			break;
+		}
+	}
+
+	return lcd_id;
+}
+
+int get_lcd_attached(char *mode)
+{
+	static int lcd_id = -EINVAL;
+
+	LCD_DEBUG("%s", mode);
+
+	if (mode == NULL)
+		return true;
+
+	if (!strncmp(mode, "GET", 3))
+		goto end;
+	else
+		lcd_id = ss_parse_panel_id(mode);
+
+	LCD_ERR("LCD_ID = 0x%X\n", lcd_id);
+end:
+
+	/* case 03830582: Sometimes, bootloader fails to save lcd_id value in cmdline
+	 * which is located in TZ.
+	 * W/A: if panel name is PBA panel while lcd_id is not PBA ID, force to set lcd_id to PBA ID.
+	 */
+	if (unlikely(lcd_id == -EINVAL)) {
+		char panel_name[MAX_CMDLINE_PARAM_LEN];
+		char panel_string[] = "ss_dsi_panel_PBA_BOOTING_FHD";
+
+		ss_get_primary_panel_name_cmdline(panel_name);
+		if (!strncmp(panel_string, panel_name, strlen(panel_string)) && lcd_id != PBA_ID) {
+			LCD_INFO("pba panel name, force lcd id: 0x%X -> 0xFFFFFF\n", lcd_id);
+			lcd_id =  PBA_ID;
+		}
+	}
+
+	return lcd_id;
+}
+EXPORT_SYMBOL(get_lcd_attached);
+__setup("lcd_id=0x", get_lcd_attached);
+
+int get_lcd_attached_secondary(char *mode)
+{
+	static int lcd_id = -EINVAL;
+
+	LCD_DEBUG("%s", mode);
+
+	if (mode == NULL)
+		return true;
+
+	if (!strncmp(mode, "GET", 3))
+		goto end;
+	else
+		lcd_id = ss_parse_panel_id(mode);
+
+
+	LCD_ERR("LCD_ID = 0x%X\n", lcd_id);
+end:
+
+	/* case 03830582: Sometimes, bootloader fails to save lcd_id value in cmdline
+	 * which is located in TZ.
+	 * W/A: if panel name is PBA panel while lcd_id is not PBA ID, force to set lcd_id to PBA ID.
+	 */
+	if (unlikely(lcd_id == -EINVAL)) {
+		char panel_name[MAX_CMDLINE_PARAM_LEN];
+		char panel_string[] = "ss_dsi_panel_PBA_BOOTING_FHD_DSI1";
+
+		ss_get_secondary_panel_name_cmdline(panel_name);
+		if (!strncmp(panel_string, panel_name, strlen(panel_string)) && lcd_id != PBA_ID) {
+			LCD_INFO("pba panel name, force lcd id: 0x%X -> 0xFFFFFF\n", lcd_id);
+			lcd_id =  PBA_ID;
+		}
+	}
+
+	return lcd_id;
+}
+EXPORT_SYMBOL(get_lcd_attached_secondary);
+__setup("lcd_id1=0x", get_lcd_attached_secondary);
+
+static void ss_event_frame_update_pre(
+		struct samsung_display_driver_data *vdd, void *arg)
+{
+	/* Block frame update during exclusive mode on.*/
+	if (unlikely(vdd->exclusive_tx.enable)) {
+		if (unlikely(!vdd->exclusive_tx.permit_frame_update)) {
+			LCD_INFO("exclusive mode on, stop frame update\n");
+			wait_event(vdd->exclusive_tx.ex_tx_waitq,
+				!vdd->exclusive_tx.enable);
+			LCD_INFO("continue frame update\n");
+		}
+	}
+}
+
+static void ss_event_frame_update(
+		struct samsung_display_driver_data *vdd, int event, void *arg)
+{
+	struct panel_func *panel_func = NULL;
+	static u8 frame_count = 1;
+	s64 cur_time_64;
+	int wait_time_32;
+	s64 wait_time_64;
+	int sleep_out_delay_32;
+	s64 sleep_out_delay_64;
+
+	panel_func = &vdd->panel_func;
+
+	sleep_out_delay_32 = vdd->dtsi_data.samsung_wait_after_sleep_out_delay;
+	sleep_out_delay_64 = (s64)sleep_out_delay_32;
+
+	cur_time_64 = ktime_to_ms(ktime_get());
+	wait_time_64 = sleep_out_delay_64 - (cur_time_64 - vdd->sleep_out_time_64);
+
+	/* To protect 64bit overflow & underflow */
+	if (wait_time_64 <= 0)
+		wait_time_32 = 0;
+	else if (wait_time_64 > sleep_out_delay_64)
+		wait_time_32 = sleep_out_delay_32;
+	else
+		wait_time_32 = (s32)wait_time_64;
+
+	if (vdd->dtsi_data.samsung_osc_te_fitting &&
+			!(vdd->te_fitting_info.status & TE_FITTING_DONE)) {
+		if (panel_func->ss_event_osc_te_fitting)
+			panel_func->ss_event_osc_te_fitting(vdd, event, arg);
+	}
+
+	if (vdd->display_status_dsi.wait_disp_on) {
+		/* TODO: Add condition to check the susupend state
+		 * insted of !msm_is_suspend_state(GET_DRM_DEV(vdd))
+		 */
+
+		/* Skip a number of frames to avoid garbage image output from wakeup */
+		if (frame_count <= vdd->dtsi_data.samsung_delayed_display_on) {
+			LCD_DEBUG("Skip %d frame\n", frame_count);
+			frame_count++;
+			goto skip_display_on;
+		}
+		frame_count = 1;
+
+		if (vdd->dtsi_data.samsung_wait_after_sleep_out_delay) {
+			if (wait_time_32 > 0) {
+				LCD_ERR("sleep_out_delay:%d sleep_out_t:%llu cur_t:%llu wait_t:%d start\n", sleep_out_delay_32,
+					  vdd->sleep_out_time_64, cur_time_64, wait_time_32);
+				usleep_range(wait_time_32*1000, wait_time_32*1000);
+				LCD_ERR("wait_t: %d end\n", wait_time_32);
+			} else
+				LCD_ERR("sleep_out_delay:%d sleep_out_t:%llu cur_t:%llu wait_t:%d skip\n", sleep_out_delay_32,
+					  vdd->sleep_out_time_64, cur_time_64, wait_time_32);
+		}
+
+		ss_send_cmd(vdd, TX_DISPLAY_ON);
+		vdd->display_status_dsi.wait_disp_on = false;
+
+		if (vdd->mdnie.support_mdnie) {
+			vdd->mdnie.lcd_on_notifiy = true;
+			update_dsi_tcon_mdnie_register(vdd);
+			if (vdd->mdnie.support_trans_dimming)
+				vdd->mdnie.disable_trans_dimming = false;
+		}
+
+		if (vdd->panel_func.samsung_backlight_late_on)
+			vdd->panel_func.samsung_backlight_late_on(vdd);
+
+		if (vdd->dtsi_data.hmt_enabled &&
+				ss_is_panel_on(vdd)) {
+			if (vdd->hmt_stat.hmt_on) {
+				LCD_INFO("hmt reset ..\n");
+				#if 0
+				vdd->hmt_stat.hmt_enable(vdd);
+				vdd->hmt_stat.hmt_reverse_update(vdd, 1);
+				vdd->hmt_stat.hmt_bright_update(vdd);
+				#endif
+			}
+		}
+
+		if (ss_is_esd_check_enabled(vdd))
+			vdd->esd_recovery.is_enabled_esd_recovery = true;
+
+		/* For read flash gamma data before first brightness set */
+		if (vdd->dtsi_data.flash_gamma_support && !vdd->panel_br_info.flash_data.init_done) {
+			if (!work_busy(&vdd->flash_br_work.work)) {
+				queue_delayed_work(vdd->flash_br_workqueue, &vdd->flash_br_work, msecs_to_jiffies(0));
+			}
+		}
+
+		LCD_INFO("DISPLAY_ON\n");
+	}
+
+	/* copr - check actual display on (frame - copr > 0) debug */
+	/* work thread will be stopped if copr is over 0 */
+	if (vdd->display_status_dsi.wait_actual_disp_on && ss_is_panel_on(vdd)) {
+		if (vdd->copr.read_copr_wq && vdd->copr.copr_on)
+			queue_work(vdd->copr.read_copr_wq, &vdd->copr.read_copr_work);
+	}
+
+skip_display_on:
+	return;
+}
+
+static void ss_send_esd_recovery_cmd(struct samsung_display_driver_data *vdd)
+{
+	static bool toggle;
+
+	if (toggle)
+		ss_send_cmd(vdd, TX_ESD_RECOVERY_1);
+	else
+		ss_send_cmd(vdd, TX_ESD_RECOVERY_2);
+	toggle = !toggle;
+}
+
+static void ss_check_te(struct samsung_display_driver_data *vdd)
+{
+	unsigned int disp_te_gpio;
+	int rc, te_count = 0;
+	int te_max = 20000; /*sampling 200ms */
+
+	disp_te_gpio = ss_get_te_gpio(vdd);
+
+	LCD_INFO("============ start waiting for TE ============\n");
+	if (gpio_is_valid(disp_te_gpio)) {
+		for (te_count = 0 ; te_count < te_max ; te_count++) {
+			rc = gpio_get_value(disp_te_gpio);
+			if (rc == 1) {
+				LCD_INFO("LDI generate TE within = %d.%dms\n", te_count/100, te_count%100);
+				break;
+			}
+			/* usleep suspends the calling thread whereas udelay is a
+			 * busy wait. Here the value of te_gpio is checked in a loop of
+			 * max count = 250. If this loop has to iterate multiple
+			 * times before the te_gpio is 1, the calling thread will end
+			 * up in suspend/wakeup sequence multiple times if usleep is
+			 * used, which is an overhead. So use udelay instead of usleep.
+			 */
+			udelay(10);
+		}
+		if (te_count == te_max) {
+			LCD_ERR("LDI doesn't generate TE");
+			SS_XLOG(0xbad);
+			inc_dpui_u32_field(DPUI_KEY_QCT_NO_TE, 1);
+		}
+	} else
+		LCD_ERR("disp_te_gpio is not valid\n");
+	LCD_INFO("============ end waiting for TE ============\n");
+}
+/* SAMSUNG_FINGERPRINT */
+static void ss_wait_for_te_gpio(struct samsung_display_driver_data *vdd, int num_of_te, int delay_after_te)
+{
+	unsigned int disp_te_gpio;
+	int rc, te_count = 0;
+	int te_max = 20000; /*sampling 100ms */
+	int iter;
+	s64 start_time_1_64, start_time_3_64;
+
+	preempt_disable();
+	disp_te_gpio = ss_get_te_gpio(vdd);
+	for(iter = 0 ; iter < num_of_te ; iter++) {
+		start_time_1_64 = ktime_to_us(ktime_get());
+		if (gpio_is_valid(disp_te_gpio)) {
+			for (te_count = 0 ; te_count < te_max ; te_count++) {
+				rc = gpio_get_value(disp_te_gpio);
+				if (rc == 1) {
+					start_time_3_64 = ktime_to_us(ktime_get());
+					LCD_ERR("ss_wait_for_te_gpio  = %llu\n", start_time_3_64- start_time_1_64);
+					break;
+				}
+				ndelay(5000);
+			}
+		}
+		if (te_count == te_max)
+			LCD_ERR("LDI doesn't generate TE");
+		udelay(200);
+	}
+	udelay(delay_after_te);
+	preempt_enable();
+}
+
+/* SAMSUNG_FINGERPRINT */
+void ss_send_hbm_fingermask_image_tx(struct samsung_display_driver_data *vdd, bool on)
+{
+	LCD_INFO("++ %s\n",on?"on":"off");
+	if (on) {
+		ss_brightness_dcs(vdd, 0, BACKLIGHT_FINGERMASK_ON);
+	} else {
+		ss_brightness_dcs(vdd, 0, BACKLIGHT_FINGERMASK_OFF);
+	}
+	LCD_INFO("--\n");
+}
+
+static void ss_event_fb_event_callback(struct samsung_display_driver_data *vdd, int event, void *arg)
+{
+	struct panel_func *panel_func = NULL;
+
+	panel_func = &vdd->panel_func;
+
+	if (IS_ERR_OR_NULL(panel_func)) {
+		LCD_ERR("Invalid data panel_func : 0x%zx\n",
+				(size_t)panel_func);
+		return;
+	}
+
+	if (panel_func->ss_event_esd_recovery_init)
+		panel_func->ss_event_esd_recovery_init(vdd, event, arg);
+}
+
+static int _ss_dsi_panel_event_handler(
+		struct samsung_display_driver_data *vdd,
+		enum mdss_intf_events event, void *arg)
+{
+	struct panel_func *panel_func = NULL;
+
+	panel_func = &vdd->panel_func;
+
+	if (IS_ERR_OR_NULL(panel_func)) {
+		LCD_ERR("Invalid data panel_func : 0x%zx\n", (size_t)panel_func);
+		return -EINVAL;
+	}
+
+	switch (event) {
+	case SS_EVENT_FRAME_UPDATE_POST:
+		if (!IS_ERR_OR_NULL(panel_func->ss_event_frame_update))
+			panel_func->ss_event_frame_update(vdd, event, arg);
+		break;
+	case SS_EVENT_FRAME_UPDATE_PRE:
+		ss_event_frame_update_pre(vdd, arg);
+		break;
+	case SS_EVENT_FB_EVENT_CALLBACK:
+		if (!IS_ERR_OR_NULL(panel_func->ss_event_fb_event_callback))
+			panel_func->ss_event_fb_event_callback(vdd, event, arg);
+		break;
+	case SS_EVENT_PANEL_ON:
+		if (likely(!vdd->is_factory_mode))
+			ss_panel_lpm_ctrl(vdd, false);
+		break;
+	case SS_EVENT_PANEL_OFF:
+		if (likely(!vdd->is_factory_mode))
+			ss_panel_lpm_ctrl(vdd, true);
+		break;
+	case SS_EVENT_PANEL_RECOVERY:
+		ss_panel_recovery(vdd);
+		break;
+	case SS_EVENT_PANEL_ESD_RECOVERY:
+		if (vdd->esd_recovery.send_esd_recovery)
+			ss_send_esd_recovery_cmd(vdd);
+		break;
+	case SS_EVENT_CHECK_TE:
+			ss_check_te(vdd);
+		break;
+	case SS_EVENT_SDE_HW_CATALOG_INIT:
+		if (unlikely(vdd->panel_func.samsung_pba_config))
+			vdd->panel_func.samsung_pba_config(vdd, arg);
+		break;
+	default:
+		LCD_DEBUG("unhandled event=%d\n", event);
+		break;
+	}
+
+	return 0;
+}
+
+int ss_dsi_panel_event_handler(
+		int display_ndx, enum mdss_intf_events event, void *arg)
+{
+
+	struct samsung_display_driver_data *vdd = ss_get_vdd(display_ndx);
+
+	if (unlikely(!vdd))
+		return -EINVAL;
+
+	return _ss_dsi_panel_event_handler(vdd, event, arg);
+}
+
+/* CP notity format (HEX raw format)
+ * 10 00 AA BB 27 01 03 XX YY YY YY YY ZZ ZZ ZZ ZZ
+ *
+ * 00 10 (0x0010) - len
+ * AA BB - not used
+ * 27 - MAIN CMD (SYSTEM CMD : 0x27)
+ * 01 - SUB CMD (CP Channel Info : 0x01)
+ * 03 - NOTI CMD (0x03)
+ * XX - RAT MODE
+ * YY YY YY YY - BAND MODE
+ * ZZ ZZ ZZ ZZ - FREQ INFO
+ */
+
+int ss_rf_info_notify_callback(struct notifier_block *nb,
+				unsigned long size, void *data)
+{
+	struct dyn_mipi_clk *dyn_mipi_clk = container_of(nb, struct dyn_mipi_clk, notifier);
+	struct samsung_display_driver_data *vdd =
+		container_of(dyn_mipi_clk, struct samsung_display_driver_data, dyn_mipi_clk);
+
+	struct dev_ril_bridge_msg *msg;
+
+	msg = (struct dev_ril_bridge_msg *)data;
+	LCD_INFO("RIL noti: ndx: %d, size: %lu, dev_id: %d, len: %d\n",
+			vdd->ndx, size, msg->dev_id, msg->data_len);
+	if (msg->dev_id == IPC_SYSTEM_CP_CHANNEL_INFO // #define IPC_SYSTEM_CP_CHANNEL_INFO	0x01
+			&& msg->data_len == sizeof(struct rf_info)) {
+		mutex_lock(&dyn_mipi_clk->dyn_mipi_lock);
+		memcpy(&dyn_mipi_clk->rf_info, msg->data, sizeof(struct rf_info));
+		mutex_unlock(&dyn_mipi_clk->dyn_mipi_lock);
+
+		queue_work(dyn_mipi_clk->change_clk_wq, &dyn_mipi_clk->change_clk_work);
+
+		LCD_INFO("RIL noti: RAT(%d), BAND(%d), ARFCN(%d)\n",
+				dyn_mipi_clk->rf_info.rat,
+				dyn_mipi_clk->rf_info.band,
+				dyn_mipi_clk->rf_info.arfcn);
+	}
+
+	return NOTIFY_DONE;
+}
+
+static int ss_find_dyn_mipi_clk_timing_idx(struct samsung_display_driver_data *vdd)
+{
+	int idx = -EINVAL;
+	int loop;
+	int rat, band, arfcn;
+	struct clk_sel_table sel_table = vdd->dyn_mipi_clk.clk_sel_table;
+
+	if (!sel_table.tab_size) {
+		LCD_ERR("Table is NULL");
+		return -ENOENT;
+	}
+
+	rat = vdd->dyn_mipi_clk.rf_info.rat;
+	band = vdd->dyn_mipi_clk.rf_info.band;
+	arfcn = vdd->dyn_mipi_clk.rf_info.arfcn;
+
+	for (loop = 0 ; loop < sel_table.tab_size ; loop++) {
+		if ((rat == sel_table.rat[loop]) && (band == sel_table.band[loop])) {
+			if ((arfcn >= sel_table.from[loop]) && (arfcn <= sel_table.end[loop])) {
+				idx = sel_table.target_clk_idx[loop];
+				break;
+			}
+		}
+	}
+
+	LCD_INFO("RAT(%d), BAND(%d), ARFCN(%d), Clock Index(%d)\n",
+		rat, band, arfcn, idx);
+
+	return idx;
+
+}
+
+/* refer to sysfs_dynamic_dsi_clk_write() */
+extern ssize_t sysfs_dynamic_dsi_clk_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count);
+static int _ss_change_dyn_mipi_clk_timing(struct samsung_display_driver_data *vdd, int clk_rate)
+{
+	struct dsi_display *display = GET_DSI_DISPLAY(vdd);
+	struct device *dev = &display->pdev->dev;
+	char clk_rate_buf[12];
+	const char *buf;
+	size_t count = 12;
+
+	LCD_INFO("+++: ndx: %d, clk_rate: %d, cached_clk_rate: %d\n",
+			vdd->ndx, clk_rate, display->cached_clk_rate);
+	sprintf(clk_rate_buf, "%d", clk_rate);
+	buf = clk_rate_buf;
+
+	sysfs_dynamic_dsi_clk_write(dev, NULL, buf, count);
+	LCD_INFO("---: ndx: %d, clk_rate: %d\n", vdd->ndx, clk_rate);
+
+	return 0;
+}
+
+
+int ss_change_dyn_mipi_clk_timing(struct samsung_display_driver_data *vdd)
+{
+	struct clk_timing_table timing_table = vdd->dyn_mipi_clk.clk_timing_table;
+	int idx;
+	int clk_rate;
+	int timeout = 60; // 60 seconds
+	int ret = 0;
+
+	if (!vdd->dyn_mipi_clk.is_support) {
+		LCD_ERR("Dynamic MIPI Clock does not support\n");
+		return -ENODEV;
+	}
+
+	if (!timing_table.tab_size) {
+		LCD_ERR("Table is NULL");
+		return -ENODEV;
+	}
+
+	mutex_lock(&dyn_mipi_clock);
+
+	LCD_INFO("+++: ndx=%d", vdd->ndx);
+
+	/*  wait for dispaly init done */
+	while (timeout-- && !vdd->display_status_dsi.disp_on_pre) {
+		msleep(1000);
+		LCD_INFO("wait time: %ds, disp_on_pre: %d\n",
+				timeout, vdd->display_status_dsi.disp_on_pre);
+
+		if (!timeout) {
+			LCD_ERR("err: display init timeout...\n");
+			goto err;
+		}
+	}
+
+	mutex_lock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
+	idx = ss_find_dyn_mipi_clk_timing_idx(vdd);
+	mutex_unlock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
+	if (idx < 0 ) {
+		LCD_ERR("Failed to find MIPI clock timing (%d)\n", idx);
+		goto err;
+	}
+
+	clk_rate = timing_table.clk_rate[idx];
+	LCD_INFO("clk idx: %d, clk_rate: %d\n", idx, clk_rate);
+
+	/* update dynamic mipi clk */
+	ret = _ss_change_dyn_mipi_clk_timing(vdd, clk_rate);
+	if (ret) {
+		LCD_ERR("fail to change mipi clk(%d), ret:%d\n", clk_rate, ret);
+		goto err;
+	}
+
+	/* update mipi global timing: skip this.. not required...  */
+err:
+	LCD_INFO("---: ndx=%d", vdd->ndx);
+	mutex_unlock(&dyn_mipi_clock);
+
+	return 0;
+}
+
+int ss_dyn_mipi_clk_tx_ffc(struct samsung_display_driver_data *vdd)
+{
+	struct dsi_panel_cmd_set *ffc_set;
+	struct dsi_panel_cmd_set *dyn_ffc_set;
+	int idx;
+	int ffc_cmds_line_position = 1;
+
+	mutex_lock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
+	idx = ss_find_dyn_mipi_clk_timing_idx(vdd);
+	mutex_unlock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
+
+	if (idx < 0 ) {
+		LCD_ERR("Failed to find MIPI clock timing (%d)\n", idx);
+		return -EINVAL;
+	}
+
+	LCD_INFO("+++ clk idx: %d, tx FFC\n", idx);
+
+	ffc_set = ss_get_cmds(vdd, TX_FFC);
+	dyn_ffc_set = ss_get_cmds(vdd, TX_DYNAMIC_FFC_SET);
+	if (SS_IS_CMDS_NULL(ffc_set) || SS_IS_CMDS_NULL(dyn_ffc_set)) {
+		LCD_ERR("No cmds for TX_FFC..\n");
+		return -EINVAL;
+	}
+
+	ffc_cmds_line_position = vdd->ffc_cmds_line_position;
+	memcpy(ffc_set->cmds[ffc_cmds_line_position].msg.tx_buf, dyn_ffc_set->cmds[idx].msg.tx_buf, ffc_set->cmds[ffc_cmds_line_position].msg.tx_len);
+
+	ss_send_cmd(vdd, TX_FFC);
+
+	LCD_INFO("--- clk idx: %d, ffc_cmds_line_position : %d tx FFC\n", idx, ffc_cmds_line_position);
+
+	return 0;
+}
+
+static int ss_parse_dyn_mipi_clk_timing_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct clk_timing_table *table = (struct clk_timing_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+
+	data = of_get_property(np, keystring, &len);
+
+	if (!data) {
+		LCD_ERR("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / sizeof(int);
+	table->clk_rate = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->clk_rate)
+		return -ENOMEM;
+
+	for (i = 0 ; i < table->tab_size; i++)
+		table->clk_rate[i] = be32_to_cpup(&data[data_offset++]);
+
+	LCD_INFO("%s tab_size (%d)\n", keystring, table->tab_size);
+
+	return 0;
+}
+
+static int ss_parse_dyn_mipi_clk_sel_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct clk_sel_table *table = (struct clk_sel_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+	int col_size = 0;
+
+	data = of_get_property(np, keystring, &len);
+
+	if (data)
+		LCD_INFO("Success to read table %s\n", keystring);
+	else {
+		LCD_ERR("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	}
+
+	col_size = 5;
+
+	if ((len % col_size) != 0) {
+		LCD_ERR("%d, Incorrect table entries for %s , len : %d",
+					__LINE__, keystring, len);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / (sizeof(int) * col_size);
+
+	table->rat = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->rat)
+		return -ENOMEM;
+	table->band = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->band)
+		goto error;
+	table->from = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->from)
+		goto error;
+	table->end = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->end)
+		goto error;
+	table->target_clk_idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->target_clk_idx)
+		goto error;
+
+	for (i = 0 ; i < table->tab_size; i++) {
+		table->rat[i] = be32_to_cpup(&data[data_offset++]);
+		table->band[i] = be32_to_cpup(&data[data_offset++]);
+		table->from[i] = be32_to_cpup(&data[data_offset++]);
+		table->end[i] = be32_to_cpup(&data[data_offset++]);
+		table->target_clk_idx[i] = be32_to_cpup(&data[data_offset++]);
+		LCD_DEBUG("%dst : %d %d %d %d %d\n",
+			i, table->rat[i], table->band[i], table->from[i],
+			table->end[i], table->target_clk_idx[i]);
+	}
+
+	LCD_INFO("%s tab_size (%d)\n", keystring, table->tab_size);
+
+	return 0;
+
+error:
+	LCD_ERR("Allocation Fail\n");
+	kfree(table->rat);
+	kfree(table->band);
+	kfree(table->from);
+	kfree(table->end);
+	kfree(table->target_clk_idx);
+
+	return -ENOMEM;
+}
+
+int ss_parse_candella_mapping_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct candela_map_table *table = (struct candela_map_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+	int col_size = 0;
+
+	data = of_get_property(np, keystring, &len);
+	if (!data) {
+		LCD_DEBUG("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	} else
+		LCD_ERR("Success to read table %s\n", keystring);
+
+	col_size = 4;
+
+	if ((len % col_size) != 0) {
+		LCD_ERR("%d, Incorrect table entries for %s , len : %d",
+					__LINE__, keystring, len);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / (sizeof(int) * col_size);
+
+	table->cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->cd)
+		goto error;
+	table->idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->idx)
+		goto error;
+	table->from = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->from)
+		goto error;
+	table->end = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->end)
+		goto error;
+
+	for (i = 0 ; i < table->tab_size; i++) {
+		table->idx[i] = be32_to_cpup(&data[data_offset++]);		/* field => <idx> */
+		table->from[i] = be32_to_cpup(&data[data_offset++]);	/* field => <from> */
+		table->end[i] = be32_to_cpup(&data[data_offset++]);		/* field => <end> */
+		table->cd[i] = be32_to_cpup(&data[data_offset++]);		/* field => <cd> */
+	}
+
+	table->min_lv = table->from[0];
+	table->max_lv = table->end[table->tab_size-1];
+
+	LCD_INFO("tab_size (%d), hbm min/max lv (%d/%d)\n", table->tab_size, table->min_lv, table->max_lv);
+
+	return 0;
+
+error:
+	kfree(table->cd);
+	kfree(table->idx);
+	kfree(table->from);
+	kfree(table->end);
+
+	return -ENOMEM;
+}
+
+int ss_parse_pac_candella_mapping_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct candela_map_table *table = (struct candela_map_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+	int col_size = 0;
+
+	data = of_get_property(np, keystring, &len);
+	if (!data) {
+		LCD_DEBUG("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	} else
+		LCD_ERR("Success to read table %s\n", keystring);
+
+	col_size = 6;
+
+	if ((len % col_size) != 0) {
+		LCD_ERR("%d, Incorrect table entries for %s , len : %d",
+					__LINE__, keystring, len);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / (sizeof(int) * col_size);
+
+	table->interpolation_cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->interpolation_cd)
+		return -ENOMEM;
+	table->cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->cd)
+		goto error;
+	table->scaled_idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->scaled_idx)
+		goto error;
+	table->idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->idx)
+		goto er->tab_size = len / (sizeof(int) * col_size);
+
+	table->rat = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->rat)
+		return -ENOMEM;
+	table->band = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->band)
+		goto error;
+	table->from = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->from)
+		goto error;
+	table->end = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->end)
+		goto error;
+	table->target_clk_idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->target_clk_idx)
+		goto error;
+
+	for (i = 0 ; i < table->tab_size; i++) {
+		table->rat[i] = be32_to_cpup(&data[data_offset++]);
+		table->band[i] = be32_to_cpup(&data[data_offset++]);
+		table->from[i] = be32_to_cpup(&data[data_offset++]);
+		table->end[i] = be32_to_cpup(&data[data_offset++]);
+		table->target_clk_idx[i] = be32_to_cpup(&data[data_offset++]);
+		LCD_DEBUG("%dst : %d %d %d %d %d\n",
+			i, table->rat[i], table->band[i], table->from[i],
+			table->end[i], table->target_clk_idx[i]);
+	}
+
+	LCD_INFO("%s tab_size (%d)\n", keystring, table->tab_size);
+
+	return 0;
+
+error:
+	LCD_ERR("Allocation Fail\n");
+	kfree(table->rat);
+	kfree(table->band);
+	kfree(table->from);
+	kfree(table->end);
+	kfree(table->target_clk_idx);
+
+	return -ENOMEM;
+}
+
+int ss_parse_candella_mapping_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct candela_map_table *table = (struct candela_map_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+	int col_size = 0;
+
+	data = of_get_property(np, keystring, &len);
+	if (!data) {
+		LCD_DEBUG("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	} else
+		LCD_ERR("Success to read table %s\n", keystring);
+
+	col_size = 4;
+
+	if ((len % col_size) != 0) {
+		LCD_ERR("%d, Incorrect table entries for %s , len : %d",
+					__LINE__, keystring, len);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / (sizeof(int) * col_size);
+
+	table->cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->cd)
+		goto error;
+	table->idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->idx)
+		goto error;
+	table->from = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->from)
+		goto error;
+	table->end = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->end)
+		goto error;
+
+	for (i = 0 ; i < table->tab_size; i++) {
+		table->idx[i] = be32_to_cpup(&data[data_offset++]);		/* field => <idx> */
+		table->from[i] = be32_to_cpup(&data[data_offset++]);	/* field => <from> */
+		table->end[i] = be32_to_cpup(&data[data_offset++]);		/* field => <end> */
+		table->cd[i] = be32_to_cpup(&data[data_offset++]);		/* field => <cd> */
+	}
+
+	table->min_lv = table->from[0];
+	table->max_lv = table->end[table->tab_size-1];
+
+	LCD_INFO("tab_size (%d), hbm min/max lv (%d/%d)\n", table->tab_size, table->min_lv, table->max_lv);
+
+	return 0;
+
+error:
+	kfree(table->cd);
+	kfree(table->idx);
+	kfree(table->from);
+	kfree(table->end);
+
+	return -ENOMEM;
+}
+
+int ss_parse_pac_candella_mapping_table(struct device_node *np,
+		void *tbl, char *keystring)
+{
+	struct candela_map_table *table = (struct candela_map_table *) tbl;
+	const __be32 *data;
+	int len = 0, i = 0, data_offset = 0;
+	int col_size = 0;
+
+	data = of_get_property(np, keystring, &len);
+	if (!data) {
+		LCD_DEBUG("%d, Unable to read table %s ", __LINE__, keystring);
+		return -EINVAL;
+	} else
+		LCD_ERR("Success to read table %s\n", keystring);
+
+	col_size = 6;
+
+	if ((len % col_size) != 0) {
+		LCD_ERR("%d, Incorrect table entries for %s , len : %d",
+					__LINE__, keystring, len);
+		return -EINVAL;
+	}
+
+	table->tab_size = len / (sizeof(int) * col_size);
+
+	table->interpolation_cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->interpolation_cd)
+		return -ENOMEM;
+	table->cd = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->cd)
+		goto error;
+	table->scaled_idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->scaled_idx)
+		goto error;
+	table->idx = kzalloc((sizeof(int) * table->tab_size), GFP_KERNEL);
+	if (!table->idx)
+		goto er

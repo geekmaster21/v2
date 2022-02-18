@@ -1,6 +1,7 @@
 #!/bin/bash
 
 DEFCONFIG=sm7150_sec_a71_eur_open_defconfig
+KERNEL_MAKE_ENV="DTC_EXT=$HOME/Desktop/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y" 
 
 # Declare your CLANG n GCC Location HERE!
 CLANG_PATH=~/clang
@@ -14,8 +15,10 @@ PATH="$CLANG_PATH/bin:${PATH}" \
                       make -j8 O=out \
                       ARCH=arm64 \
                       CC=clang \
-                      LLVM=1 LLVM_IAS=0 \
-                      CROSS_COMPILE=aarch64-linux-gnu- \
+                      LLVM=1 \
+                      $KERNEL_MAKE_ENV \
+                      CROSS_COMPILE=$HOME/aarch64/bin/aarch64-linux-android- \
+                      CLANG_TRIPLE=aarch64-linux-gnu- \
                       LD=ld.lld \
                       AR=llvm-ar \
                       NM=llvm-nm \

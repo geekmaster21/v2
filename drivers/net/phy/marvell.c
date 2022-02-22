@@ -907,15 +907,16 @@ static int m88e1118_config_aneg(struct phy_device *phydev)
 {
 	int err;
 
+	err = genphy_soft_reset(phydev);
+	if (err < 0)
+		return err;
+
 	err = marvell_set_polarity(phydev, phydev->mdix_ctrl);
 	if (err < 0)
 		return err;
 
 	err = genphy_config_aneg(phydev);
-	if (err < 0)
-		return err;
-
-	return genphy_soft_reset(phydev);
+	return 0;
 }
 
 static int m88e1118_config_init(struct phy_device *phydev)

@@ -1,32 +1,61 @@
 #!/bin/bash
 
-DEFCONFIG=sm7150_sec_a71_eur_open_defconfig
-KERNEL_MAKE_ENV="DTC_EXT=$HOME/Desktop/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y" 
+# Check if have toolchain/llvm folder
+if [ ! -d "$(pwd)/gcc/" ]; then
+   git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc -b android-9.0.0_r59 --depth 1 >> /dev/null 2> /dev/null
+fi
 
-# Declare your CLANG n GCC Location HERE!
-CLANG_PATH=~/clang
-#GCC_PATH=~/Android/gcc/aarch64-linux-android-4.9
+if [ ! -d "$(pwd)/llvm-sdclang/" ]; then
+   git clone https://github.com/proprietary-stuff/llvm-arm-toolchain-ship-10.0 llvm-sdclang --depth 1 >> /dev/null 2> /dev/null
+fi
 
+# Export KBUILD flags
+export KBUILD_BUILD_USER="Geekmaster21"
+export KBUILD_BUILD_HOST="Geekmaster21"
+
+# Export ARCH/SUBARCH flags
+export ARCH="arm64"
+export SUBARCH="arm64"
+
+# Export ANDROID VERSION
+export PLATFORM_VERSION=11
 export ANDROID_MAJOR_VERSION=r
 
-make O=out ARCH=arm64 $DEFCONFIG
+# Export CCACHE
+export CCACHE_EXEC="$(which ccache)"
+export CCACHE="${CCACHE_EXEC}"
+export CCACHE_COMPRESS="1"
+export USE_CCACHE="1"
+ccache -M 50G
 
-PATH="$CLANG_PATH/bin:${PATH}" \
-                      make -j8 O=out \
-                      ARCH=arm64 \
-                      CC=clang \
-                      LLVM=1 \
-                      $KERNEL_MAKE_ENV \
-                      CROSS_COMPILE=$HOME/aarch64/bin/aarch64-linux-android- \
-                      CLANG_TRIPLE=aarch64-linux-gnu- \
-                      LD=ld.lld \
-                      AR=llvm-ar \
-                      NM=llvm-nm \
-                      STRIP=llvm-strip \
-                      OBJCOPY=llvm-objcopy \
-                      OBJDUMP=llvm-objdump \
-                      READELF=llvm-readelf \
-                      HOSTCC=clang \
-                      HOSTCXX=clang++ \
-                      HOSTAR=llvm-ar \
-                      HOSTLD=ld.lld
+# Export toolchain/clang/llvm flags
+export CROSS_COMPILE="$(pwd)/gcc/bin/aarch64-linux-android-"
+export CLANG_TRIPLE="aarch64-linux-gnu-"
+export CC="$(pwd)/llvm-sdclang/bin/clang"
+export KERNEL_MAKE_ENV="DTC_EXT=$(pwd)/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+
+# Export if/else outdir var
+export WITH_OUTDIR=true
+
+# Clear the console
+clear
+
+# Remove out dir folder and clean the source
+if [ "${WITH_OUTDIR}" == true ]; then
+   if [ -d "$(pwd)/a71" ]; then
+      rm -rf a71
+   fi
+fi
+
+# Build time
+if [ "${WITH_OUTDIR}" == true ]; then
+   if [ ! -d "$(pwd)/a71" ]; then
+      mkdir a71
+   fi
+fi
+
+if [ "${WITH_OUTDIR}" == true ]; then
+   "${CCACHE}" make O=a71 ARCH=arm64 sm7150_sec_a71_eur_open_defconfig
+   "${CCACHE}" make -j8 O=a71 $KERNEL_MAKE_ENV
+   tools/mkdtimg create a71/arch/arm64/boot/dtbo.img --page_size=4096 $(find a71/arch -name "*.dtbo")
+fi

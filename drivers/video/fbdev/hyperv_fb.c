@@ -712,14 +712,7 @@ static int hvfb_getmem(struct hv_device *hdev, struct fb_info *info)
 		goto err1;
 	}
 
-<<<<<<< HEAD
 	fb_virt = ioremap(par->mem->start, screen_fb_size);
-=======
-	/*
-	 * Map the VRAM cacheable for performance.
-	 */
-	fb_virt = ioremap_wc(par->mem->start, screen_fb_size);
->>>>>>> 04c1d6069d93 (video: hyperv_fb: Fix the mmap() regression for v5.4.y and older)
 	if (!fb_virt)
 		goto err2;
 

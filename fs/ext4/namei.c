@@ -2593,7 +2593,7 @@ int ext4_generic_delete_entry(handle_t *handle,
 	pde = NULL;
 	de = (struct ext4_dir_entry_2 *)entry_buf;
 	while (i < buf_size - csum_size) {
-		if (ext4_check_dir_entry(dir, NULL, de, bh,
+		if (__ext4_check_dir_entry(dir, NULL, de, bh,
 					 entry_buf, buf_size, i))
 			return -EFSCORRUPTED;
 		if (de == de_del)  {

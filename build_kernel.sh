@@ -8,8 +8,8 @@ BUILD_CROSS_COMPILE=aarch64-elf-
 KERNEL_MAKE_ENV="DTC_EXT=$BUILD_KERNEL_DIR/tools/dtc"
 KERNEL_MAKE_ENV+=" DTC_OVERLAY_TEST_EXT=$BUILD_KERNEL_DIR/tools/ufdt_apply_overlay"
 KERNEL_MAKE_ENV+=" CONFIG_BUILD_ARM64_DT_OVERLAY=y"
-
 KBUILD_COMPILER_STRING=$("$GCC64_DIR"/bin/aarch64-elf-gcc --version | head -n 1)
+
 export GCC64_DIR=/workspace/v2/gcc-arm64
 
 PATH=$GCC64_DIR/bin/:/usr/bin:$PATH \
